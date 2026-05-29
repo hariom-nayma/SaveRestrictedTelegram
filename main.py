@@ -7,6 +7,7 @@ import random
 import json
 import asyncio
 import logging
+import urllib.request
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
@@ -967,6 +968,32 @@ async def start_web_server():
     except Exception as e:
         logger.error(f"Failed to start web server on port {port_num}: {e}")
 
+# Background task to self-ping the Render Web Service and prevent spin-down/sleep
+async def self_ping_loop():
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        logger.info("RENDER_EXTERNAL_URL environment variable is not set. Skipping self-ping.")
+        return
+        
+    logger.info(f"Self-ping loop started. Will ping '{url}' every 10 minutes to stay awake.")
+    while True:
+        # Sleep for 10 minutes (600 seconds)
+        await asyncio.sleep(600)
+        try:
+            logger.info(f"Sending self-ping to {url}...")
+            # Use run_in_executor to avoid blocking the event loop
+            loop = asyncio.get_running_loop()
+            def do_ping():
+                try:
+                    with urllib.request.urlopen(url, timeout=15) as response:
+                        response.read()
+                except Exception as err:
+                    logger.warning(f"Error in do_ping request: {err}")
+            await loop.run_in_executor(None, do_ping)
+            logger.info("Self-ping completed successfully.")
+        except Exception as e:
+            logger.warning(f"Self-ping loop encountered an error: {e}")
+
 async def main():
     global bot_client
     
@@ -974,6 +1001,10 @@ async def main():
     port = os.getenv("PORT")
     if port:
         asyncio.create_task(start_web_server())
+        
+    # Start self-ping loop to prevent Render Free Tier from sleeping
+    if os.getenv("RENDER_EXTERNAL_URL"):
+        asyncio.create_task(self_ping_loop())
         
     print("="*60)
     print("      🚀 SaveRestricted Telegram Userbot Initialization 🚀      ")
