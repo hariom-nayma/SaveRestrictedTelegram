@@ -783,16 +783,24 @@ async def run_clone_loop(status_msg):
         # Limit traceback length to prevent Telegram message length limits (max 4096 chars)
         tb_display = tb_str[-1500:] if len(tb_str) > 1500 else tb_str
         
-        await status_msg.edit(
+        error_text = (
             f"⚠️ **Cloning Interrupted by Error**\n\n"
             f"**Error:** `{str(e)}`\n\n"
             f"**Traceback:**\n```python\n{tb_display}\n```\n"
             f"Progress has been saved at Message ID `{clone_state.get('last_processed_id')}`.\n"
-            f"You can resume anytime.",
-            buttons=[
-                [Button.inline("⏯️ Resume", b"clone_resume"), Button.inline("❌ Cancel", b"clone_cancel")]
-            ] if bot_client else None
+            f"You can resume anytime."
         )
+        buttons = [
+            [Button.inline("⏯️ Resume", b"clone_resume"), Button.inline("❌ Cancel", b"clone_cancel")]
+        ] if bot_client else None
+
+        try:
+            await status_msg.edit(error_text, buttons=buttons)
+        except Exception:
+            try:
+                await status_msg.respond(error_text, buttons=buttons)
+            except Exception as ex:
+                logger.error(f"Failed to send clone loop error fallback message: {ex}")
 
 # Event Handler: Listen to all incoming messages from yourself in Saved Messages
 @client.on(events.NewMessage(chats='me'))
@@ -1029,6 +1037,20 @@ async def handle_bot_message(event):
             f"📥 **Current Upload Destination:** `{dest_desc}`"
         )
 
+async def safe_edit_or_respond(event, text, buttons=None):
+    try:
+        return await event.edit(text, buttons=buttons)
+    except FloodWaitError as e:
+        logger.warning(f"Failed to edit callback message due to FloodWait ({e.seconds}s). Falling back to sending a new message.")
+        return await event.respond(text, buttons=buttons)
+    except Exception as e:
+        logger.warning(f"Failed to edit callback message: {e}. Falling back to sending a new message.")
+        try:
+            return await event.respond(text, buttons=buttons)
+        except Exception as ex:
+            logger.error(f"Failed fallback respond call: {ex}")
+            return None
+
 async def handle_callback(event):
     global active_clone_task, clone_state
     data = event.data
@@ -1036,8 +1058,9 @@ async def handle_callback(event):
     if data == b"clone_start":
         await event.answer("Starting clone loop...", cache_time=0)
         await safe_cancel_active_task()
-        msg = await event.edit("🔄 **Initializing clone process...**")
-        active_clone_task = asyncio.create_task(run_clone_loop(msg))
+        msg = await safe_edit_or_respond(event, "🔄 **Initializing clone process...**")
+        if msg:
+            active_clone_task = asyncio.create_task(run_clone_loop(msg))
         
     elif data == b"clone_resume":
         await event.answer("Resuming clone...", cache_time=0)
@@ -1045,8 +1068,9 @@ async def handle_callback(event):
         # Set running state
         clone_state["status"] = "running"
         save_clone_state()
-        msg = await event.edit("🔄 **Resuming clone process...**")
-        active_clone_task = asyncio.create_task(run_clone_loop(msg))
+        msg = await safe_edit_or_respond(event, "🔄 **Resuming clone process...**")
+        if msg:
+            active_clone_task = asyncio.create_task(run_clone_loop(msg))
         
     elif data == b"clone_fresh":
         await event.answer("Starting fresh clone...", cache_time=0)
@@ -1060,8 +1084,9 @@ async def handle_callback(event):
             "batch_count": 0
         })
         save_clone_state()
-        msg = await event.edit("🔄 **Starting fresh clone process...**")
-        active_clone_task = asyncio.create_task(run_clone_loop(msg))
+        msg = await safe_edit_or_respond(event, "🔄 **Starting fresh clone process...**")
+        if msg:
+            active_clone_task = asyncio.create_task(run_clone_loop(msg))
         
     elif data == b"clone_pause":
         await event.answer("Pausing clone...", cache_time=0)
@@ -1070,7 +1095,8 @@ async def handle_callback(event):
         await asyncio.sleep(1)
         
         dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
-        await event.edit(
+        await safe_edit_or_respond(
+            event,
             f"⏸️ **Cloning Paused**\n\n"
             f"• **Source Chat:** `{clone_state.get('source_chat_id')}`\n"
             f"• **Last Processed ID:** `{clone_state.get('last_processed_id')}`\n"
@@ -1090,7 +1116,8 @@ async def handle_callback(event):
         await asyncio.sleep(1)
         
         dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
-        await event.edit(
+        await safe_edit_or_respond(
+            event,
             f"🛑 **Cloning Stopped & Progress Saved**\n\n"
             f"• **Source Chat:** `{clone_state.get('source_chat_id')}`\n"
             f"• **Last Message ID:** `{clone_state.get('last_processed_id')}`\n"
@@ -1113,7 +1140,7 @@ async def handle_callback(event):
             except Exception:
                 pass
         clone_state.clear()
-        await event.edit("❌ **Cloning Cancelled.** Persistent state has been cleared.")
+        await safe_edit_or_respond(event, "❌ **Cloning Cancelled.** Persistent state has been cleared.")
 
 def register_bot_handlers(bot):
     bot.add_event_handler(handle_bot_message, events.NewMessage(incoming=True))
