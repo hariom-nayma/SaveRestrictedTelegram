@@ -62,6 +62,84 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clone_sta
 clone_state = {}
 active_clone_task = None
 
+async def safe_cancel_active_task():
+    global active_clone_task
+    if active_clone_task and not active_clone_task.done():
+        logger.info("Cancelling active clone task to prevent duplicate loops...")
+        active_clone_task.cancel()
+        try:
+            await active_clone_task
+        except asyncio.CancelledError:
+            logger.info("Active clone task successfully cancelled.")
+        except Exception as e:
+            logger.warning(f"Error while cancelling active task: {e}")
+        finally:
+            active_clone_task = None
+
+async def restart_bot():
+    logger.info("Restarting bot process...")
+    # 1. Cancel active clone task if any
+    global active_clone_task
+    if active_clone_task and not active_clone_task.done():
+        active_clone_task.cancel()
+        try:
+            await active_clone_task
+        except asyncio.CancelledError:
+            pass
+            
+    # 2. Disconnect clients
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    if bot_client:
+        try:
+            await bot_client.disconnect()
+        except Exception:
+            pass
+            
+    # 3. Execv to restart process
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+async def refresh_bot(status_msg):
+    global active_clone_task, clone_state
+    
+    try:
+        await status_msg.edit("🔄 **Refreshing bot...**\n1. Reloading environment variables...")
+        # Reload .env
+        load_dotenv(override=True)
+        
+        await status_msg.edit("🔄 **Refreshing bot...**\n2. Re-resolving destination chat...")
+        # Re-resolve upload chat
+        await resolve_upload_chat()
+        
+        await status_msg.edit("🔄 **Refreshing bot...**\n3. Loading clone state...")
+        # Reload clone state
+        load_clone_state()
+        
+        await status_msg.edit("🔄 **Refreshing bot...**\n4. Re-fetching dialogs...")
+        # Refresh client dialogs/cache
+        try:
+            await client.get_dialogs(limit=20)
+        except Exception as e:
+            logger.warning(f"Failed to refresh userbot dialogs: {e}")
+            
+        if bot_client:
+            try:
+                await bot_client.get_dialogs(limit=20)
+            except Exception as e:
+                logger.warning(f"Failed to refresh controller bot dialogs: {e}")
+        
+        dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
+        await status_msg.edit(
+            f"✅ **Bot Refreshed Successfully!**\n\n"
+            f"📥 **Destination Chat:** `{dest_desc}`\n"
+            f"📂 **Clone State:** `{clone_state.get('status', 'idle')}`"
+        )
+    except Exception as e:
+        logger.error(f"Error during refresh: {e}", exc_info=True)
+        await status_msg.edit(f"❌ **Failed to refresh bot:** `{str(e)}`")
+
 def load_clone_state():
     global clone_state
     if os.path.exists(STATE_FILE):
@@ -254,17 +332,38 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
         
     batch_str = f"[{current_item}/{total_items}] " if not is_numeric or total_val > 1 else ""
     
+    # Determine if we should create a separate message or edit status_msg directly
+    is_multi = False
     try:
+        # If total_items is not an integer or is greater than 1, it's a multi-file batch/clone process
+        if isinstance(total_items, str) and not total_items.strip().isdigit():
+            is_multi = True
+        elif int(total_items) > 1:
+            is_multi = True
+    except (ValueError, TypeError):
+        is_multi = True
+
+    file_path = None
+    thumb_path = None
+    file_status_msg = None
+    
+    try:
+        if is_multi:
+            # Create a separate message for the current file's progress
+            file_status_msg = await status_msg.respond(f"🔍 {batch_str}Fetching message metadata for ID `{message_id}`...")
+        else:
+            file_status_msg = status_msg
+            await file_status_msg.edit(f"🔍 {batch_str}Fetching message metadata for ID `{message_id}`...")
+
         # 1. Fetch the message
-        await status_msg.edit(f"🔍 {batch_str}Fetching message metadata for ID `{message_id}`...")
         msg = await client.get_messages(chat_entity, ids=message_id)
         
         if not msg:
-            await status_msg.edit(f"❌ {batch_str}Error: Message `{message_id}` not found.")
+            await file_status_msg.edit(f"❌ {batch_str}Error: Message `{message_id}` not found.")
             return False
             
         if not msg.media:
-            await status_msg.edit(f"❌ {batch_str}Error: Message `{message_id}` contains no media/files.")
+            await file_status_msg.edit(f"❌ {batch_str}Error: Message `{message_id}` contains no media/files.")
             return False
 
         # Check if the media is a video/document
@@ -286,7 +385,7 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
         
         # 2. Download Media chunk-by-chunk
         logger.info(f"Starting download of file: {file_name} (Size: {msg.file.size} bytes)")
-        tracker = ProgressTracker(status_msg, "📥 Downloading Video", total_items, current_item)
+        tracker = ProgressTracker(file_status_msg, "📥 Downloading Video", total_items, current_item)
         
         start_t = time.time()
         await client.download_media(
@@ -349,7 +448,7 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
         
         # 3. Upload Media back to Saved Messages
         dest_name = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else "Target Channel"
-        tracker_upload = ProgressTracker(status_msg, f"📤 Uploading Video to {dest_name}", total_items, current_item)
+        tracker_upload = ProgressTracker(file_status_msg, f"📤 Uploading Video to {dest_name}", total_items, current_item)
         
         caption = (
             f"🎥 **Restricted Video Downloaded**\n\n"
@@ -377,25 +476,64 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
         if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
             
+        # Delete the file progress message to keep chat clean
+        if is_multi and file_status_msg:
+            try:
+                await file_status_msg.delete()
+            except Exception:
+                pass
+                
         return True
         
     except FloodWaitError as e:
         logger.warning(f"Hit Telegram FloodWait: must wait {e.seconds} seconds.")
-        await status_msg.edit(f"⚠️ Throttled by Telegram! Sleeping for `{e.seconds}` seconds...")
+        target_msg = file_status_msg if file_status_msg else status_msg
+        try:
+            await target_msg.edit(f"⚠️ Throttled by Telegram! Sleeping for `{e.seconds}` seconds...")
+        except Exception:
+            pass
         await asyncio.sleep(e.seconds)
+        if is_multi and file_status_msg:
+            try:
+                await file_status_msg.delete()
+            except Exception:
+                pass
         # Retry once
         return await download_and_upload_video(chat_entity, message_id, status_msg, link_str, batch_info)
         
-    except Exception as e:
-        logger.error(f"Failed to process message ID {message_id}: {str(e)}", exc_info=True)
-        await status_msg.edit(f"❌ {batch_str}Failed to download message ID `{message_id}`.\nError: `{str(e)}`")
-        # Clean up if files were partially downloaded or left
-        if 'file_path' in locals() and os.path.exists(file_path):
+    except asyncio.CancelledError:
+        logger.info(f"Task cancelled during download/upload of message ID {message_id}")
+        if is_multi and file_status_msg:
+            try:
+                await file_status_msg.delete()
+            except Exception:
+                pass
+        if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
             except Exception:
                 pass
-        if 'thumb_path' in locals() and thumb_path and os.path.exists(thumb_path):
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except Exception:
+                pass
+        raise
+        
+    except Exception as e:
+        logger.error(f"Failed to process message ID {message_id}: {str(e)}", exc_info=True)
+        target_msg = file_status_msg if file_status_msg else status_msg
+        try:
+            await target_msg.edit(f"❌ {batch_str}Failed to download message ID `{message_id}`.\nError: `{str(e)}`")
+        except Exception:
+            pass
+        # Clean up if files were partially downloaded or left
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+        if thumb_path and os.path.exists(thumb_path):
             try:
                 os.remove(thumb_path)
             except Exception:
@@ -630,6 +768,18 @@ async def handle_new_message(event):
     if not text:
         return
         
+    # --- Command: Restart ---
+    if text == "/restart":
+        await event.reply("🔄 **Restarting SaveRestricted bot...**")
+        await restart_bot()
+        return
+
+    # --- Command: Refresh ---
+    if text == "/refresh":
+        status = await event.reply("🔄 **Refreshing bot configuration & connection...**")
+        await refresh_bot(status)
+        return
+
     # --- Command: Batch Download ---
     if text.startswith("/batch"):
         parts = text.split()
@@ -750,6 +900,18 @@ async def handle_bot_message(event):
     if not text:
         return
         
+    # Command: /restart
+    if text == "/restart":
+        await event.reply("🔄 **Restarting SaveRestricted bot...**")
+        await restart_bot()
+        return
+
+    # Command: /refresh
+    if text == "/refresh":
+        status = await event.reply("🔄 **Refreshing bot configuration & connection...**")
+        await refresh_bot(status)
+        return
+
     # Command: /clone
     if text.startswith("/clone"):
         parts = text.split(maxsplit=1)
@@ -827,6 +989,8 @@ async def handle_bot_message(event):
             "This bot acts as your interactive controller for cloning channels and downloading media.\n\n"
             "💡 **Commands:**\n"
             "• `/clone <message_link>` - Start interactive channel cloning starting from any message\n"
+            "• `/restart` - Restart the bot process completely\n"
+            "• `/refresh` - Reload configuration and refresh client connection\n"
             "• `/help` - Show this message\n\n"
             f"📥 **Current Upload Destination:** `{dest_desc}`"
         )
@@ -837,11 +1001,13 @@ async def handle_callback(event):
     
     if data == b"clone_start":
         await event.answer("Starting clone loop...", cache_time=0)
+        await safe_cancel_active_task()
         msg = await event.edit("🔄 **Initializing clone process...**")
         active_clone_task = asyncio.create_task(run_clone_loop(msg))
         
     elif data == b"clone_resume":
         await event.answer("Resuming clone...", cache_time=0)
+        await safe_cancel_active_task()
         # Set running state
         clone_state["status"] = "running"
         save_clone_state()
@@ -850,6 +1016,7 @@ async def handle_callback(event):
         
     elif data == b"clone_fresh":
         await event.answer("Starting fresh clone...", cache_time=0)
+        await safe_cancel_active_task()
         # Clear processing state
         clone_state.update({
             "last_processed_id": None,
