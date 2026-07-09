@@ -572,43 +572,28 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
 
 async def run_clone_loop(status_msg):
     global clone_state, active_clone_task
-    
-    source_chat = clone_state.get("source_chat_id")
-    is_private = clone_state.get("is_private")
-    
-    # Force cast start_msg_id to int to prevent any legacy str vs int TypeErrors
     try:
-        start_msg_id = int(clone_state.get("start_msg_id")) if clone_state.get("start_msg_id") is not None else None
-    except (ValueError, TypeError):
-        start_msg_id = None
+        source_chat = clone_state.get("source_chat_id")
+        is_private = clone_state.get("is_private")
         
-    if not source_chat or start_msg_id is None:
-        logger.error("Source chat or start message ID missing from clone state.")
-        await safe_edit_msg(status_msg, "❌ **Error:** Invalid clone state configuration.")
-        return
-        
-    status_msg = await safe_edit_msg(status_msg, "🔄 **Step 1/3: Resolving source channel entity...**")
-    
-    # 1. Resolve source chat entity (Directly try standard resolution first to save time and network calls)
-    chat_entity = None
-    try:
-        if is_private:
-            # Try to resolve using full channel ID with -100 prefix first (very reliable if already joined/cached)
-            try:
-                chat_entity = await asyncio.wait_for(client.get_entity(int(f"-100{source_chat}")), timeout=15)
-            except Exception:
-                peer = PeerChannel(int(source_chat))
-                chat_entity = await asyncio.wait_for(client.get_entity(peer), timeout=15)
-        else:
-            chat_entity = await asyncio.wait_for(client.get_entity(source_chat), timeout=15)
-    except Exception as e:
-        # Fallback: only fetch recent dialogs if direct resolution fails
-        logger.info(f"Direct resolution failed ({e}). Refreshing recent dialogs as fallback...")
-        status_msg = await safe_edit_msg(status_msg, "🔄 **Step 1/3: Channel not cached. Fetching recent dialogs as fallback...**")
+        # Force cast start_msg_id to int to prevent any legacy str vs int TypeErrors
         try:
-            # Limit dialogs to most recent 80 to make it extremely fast and lightweight
-            await asyncio.wait_for(client.get_dialogs(limit=80), timeout=20)
+            start_msg_id = int(clone_state.get("start_msg_id")) if clone_state.get("start_msg_id") is not None else None
+        except (ValueError, TypeError):
+            start_msg_id = None
+            
+        if not source_chat or start_msg_id is None:
+            logger.error("Source chat or start message ID missing from clone state.")
+            await safe_edit_msg(status_msg, "❌ **Error:** Invalid clone state configuration.")
+            return
+            
+        status_msg = await safe_edit_msg(status_msg, "🔄 **Step 1/3: Resolving source channel entity...**")
+        
+        # 1. Resolve source chat entity (Directly try standard resolution first to save time and network calls)
+        chat_entity = None
+        try:
             if is_private:
+                # Try to resolve using full channel ID with -100 prefix first (very reliable if already joined/cached)
                 try:
                     chat_entity = await asyncio.wait_for(client.get_entity(int(f"-100{source_chat}")), timeout=15)
                 except Exception:
@@ -616,47 +601,62 @@ async def run_clone_loop(status_msg):
                     chat_entity = await asyncio.wait_for(client.get_entity(peer), timeout=15)
             else:
                 chat_entity = await asyncio.wait_for(client.get_entity(source_chat), timeout=15)
-        except Exception as err:
-            clone_state["status"] = "stopped"
-            save_clone_state()
-            await safe_edit_msg(status_msg, f"❌ **Failed to access source channel:** `{str(err)}`\nMake sure your account is a member of the channel.")
-            return
+        except Exception as e:
+            # Fallback: only fetch recent dialogs if direct resolution fails
+            logger.info(f"Direct resolution failed ({e}). Refreshing recent dialogs as fallback...")
+            status_msg = await safe_edit_msg(status_msg, "🔄 **Step 1/3: Channel not cached. Fetching recent dialogs as fallback...**")
+            try:
+                # Limit dialogs to most recent 80 to make it extremely fast and lightweight
+                await asyncio.wait_for(client.get_dialogs(limit=80), timeout=20)
+                if is_private:
+                    try:
+                        chat_entity = await asyncio.wait_for(client.get_entity(int(f"-100{source_chat}")), timeout=15)
+                    except Exception:
+                        peer = PeerChannel(int(source_chat))
+                        chat_entity = await asyncio.wait_for(client.get_entity(peer), timeout=15)
+                else:
+                    chat_entity = await asyncio.wait_for(client.get_entity(source_chat), timeout=15)
+            except Exception as err:
+                clone_state["status"] = "stopped"
+                save_clone_state()
+                await safe_edit_msg(status_msg, f"❌ **Failed to access source channel:** `{str(err)}`\nMake sure your account is a member of the channel.")
+                return
 
-    status_msg = await safe_edit_msg(status_msg, "🔄 **Step 2/3: Fetching latest message details...**")
+        status_msg = await safe_edit_msg(status_msg, "🔄 **Step 2/3: Fetching latest message details...**")
 
-    # 2. Retrieve the latest message ID to calculate progress and messages remaining
-    try:
-        latest_msgs = await asyncio.wait_for(client.get_messages(chat_entity, limit=1), timeout=15)
-        if latest_msgs:
-            clone_state["latest_msg_id"] = int(latest_msgs[0].id)
-        else:
+        # 2. Retrieve the latest message ID to calculate progress and messages remaining
+        try:
+            latest_msgs = await asyncio.wait_for(client.get_messages(chat_entity, limit=1), timeout=15)
+            if latest_msgs:
+                clone_state["latest_msg_id"] = int(latest_msgs[0].id)
+            else:
+                clone_state["latest_msg_id"] = int(start_msg_id)
+        except Exception as e:
+            logger.warning(f"Could not retrieve latest message ID: {e}")
             clone_state["latest_msg_id"] = int(start_msg_id)
-    except Exception as e:
-        logger.warning(f"Could not retrieve latest message ID: {e}")
-        clone_state["latest_msg_id"] = int(start_msg_id)
+            
+        status_msg = await safe_edit_msg(status_msg, "🔄 **Step 3/3: Initializing chronological download stream...**")
         
-    status_msg = await safe_edit_msg(status_msg, "🔄 **Step 3/3: Initializing chronological download stream...**")
-    
-    # Determine starting message ID
-    try:
-        if clone_state.get("last_processed_id") is not None:
-            start_from = int(clone_state["last_processed_id"])
-        else:
-            start_from = int(start_msg_id)
-    except (ValueError, TypeError):
-        start_from = start_msg_id
-        
-    clone_state["status"] = "running"
-    save_clone_state()
+        # Determine starting message ID
+        try:
+            if clone_state.get("last_processed_id") is not None:
+                start_from = int(clone_state["last_processed_id"])
+            else:
+                start_from = int(start_msg_id)
+        except (ValueError, TypeError):
+            start_from = start_msg_id
+            
+        clone_state["status"] = "running"
+        save_clone_state()
 
-    # exclusive range in iter_messages min_id parameter
-    min_id = start_from - 1 if start_from and start_from > 0 else 0
-    
-    logger.info(f"Starting cloning from message ID {start_from} (min_id: {min_id})")
-    
-    last_overall_update_time = 0
-    skipped_count_since_update = 0
-    try:
+        # exclusive range in iter_messages min_id parameter
+        min_id = start_from - 1 if start_from and start_from > 0 else 0
+        
+        logger.info(f"Starting cloning from message ID {start_from} (min_id: {min_id})")
+        
+        last_overall_update_time = 0
+        skipped_count_since_update = 0
+        
         async for msg in client.iter_messages(chat_entity, min_id=min_id, reverse=True):
             # Check if task was paused/stopped
             if clone_state.get("status") in ("paused", "stopped"):
