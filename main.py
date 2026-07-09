@@ -245,17 +245,23 @@ class ProgressTracker:
         except (ValueError, TypeError):
             self.is_numeric = False
             self.total_items_val = 0
+        self.last_percentage = 0.0
 
     async def progress_callback(self, current, total):
         if not total:
             return
             
         now = time.time()
-        # Throttled progress update: max once every 2.2 seconds OR when download is complete (100%)
-        if now - self.last_update_time < 2.2 and current < total:
+        percentage = (current / total) * 100
+        time_elapsed = now - self.last_update_time
+        percent_diff = percentage - self.last_percentage
+        
+        # Throttled progress update: max once every 5.0 seconds and at least 10% change OR when complete
+        if current < total and (time_elapsed < 5.0 or percent_diff < 10.0):
             return
             
         self.last_update_time = now
+        self.last_percentage = percentage
         elapsed = now - self.start_time
         percentage = (current / total) * 100
         
@@ -487,6 +493,10 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
         
     except FloodWaitError as e:
         logger.warning(f"Hit Telegram FloodWait: must wait {e.seconds} seconds.")
+        if e.seconds > 180:
+            logger.warning(f"FloodWait duration too long ({e.seconds}s). Raising exception to pause the clone loop.")
+            raise e
+            
         target_msg = file_status_msg if file_status_msg else status_msg
         try:
             await target_msg.edit(f"⚠️ Throttled by Telegram! Sleeping for `{e.seconds}` seconds...")
@@ -624,6 +634,8 @@ async def run_clone_loop(status_msg):
     
     logger.info(f"Starting cloning from message ID {start_from} (min_id: {min_id})")
     
+    last_overall_update_time = 0
+    skipped_count_since_update = 0
     try:
         async for msg in client.iter_messages(chat_entity, min_id=min_id, reverse=True):
             # Check if task was paused/stopped
@@ -649,21 +661,43 @@ async def run_clone_loop(status_msg):
             # Show live stats in edit
             dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
             
-            await status_msg.edit(
-                f"🔄 **Cloning Channel in Progress...**\n\n"
-                f"📊 **Clone Analytics:**\n"
-                f"• 📁 **Source Chat:** `{source_chat}`\n"
-                f"• 📥 **Destination:** `{dest_desc}`\n"
-                f"• 🎥 **Videos Cloned:** `{clone_state.get('total_cloned', 0)}`\n"
-                f"• ⏩ **Skipped (No Media):** `{clone_state.get('total_skipped', 0)}`\n"
-                f"• ⏳ **Messages Remaining:** `{remaining}`\n"
-                f"• 📈 **Milestone Batch:** `{clone_state.get('batch_count', 0)}/60`\n"
-                f"• 📊 **Overall Progress:** `[{bar}]` **{percentage:.1f}%**\n\n"
-                f"_Current Message ID: `{msg.id}`_",
-                buttons=[
-                    [Button.inline("⏸️ Pause", b"clone_pause"), Button.inline("🛑 Stop", b"clone_stop")]
-                ] if bot_client else None
-            )
+            now = time.time()
+            # Only update overall status if:
+            # - It's the first run (last_overall_update_time == 0)
+            # - OR we are about to download/upload media (has_media is True)
+            # - OR 12 seconds have passed since the last edit
+            # - OR we have skipped 10 messages since the last edit
+            should_edit_status = False
+            if last_overall_update_time == 0 or has_media:
+                should_edit_status = True
+            elif now - last_overall_update_time >= 12.0:
+                should_edit_status = True
+            elif skipped_count_since_update >= 10:
+                should_edit_status = True
+
+            if should_edit_status:
+                last_overall_update_time = now
+                skipped_count_since_update = 0
+                try:
+                    await status_msg.edit(
+                        f"🔄 **Cloning Channel in Progress...**\n\n"
+                        f"📊 **Clone Analytics:**\n"
+                        f"• 📁 **Source Chat:** `{source_chat}`\n"
+                        f"• 📥 **Destination:** `{dest_desc}`\n"
+                        f"• 🎥 **Videos Cloned:** `{clone_state.get('total_cloned', 0)}`\n"
+                        f"• ⏩ **Skipped (No Media):** `{clone_state.get('total_skipped', 0)}`\n"
+                        f"• ⏳ **Messages Remaining:** `{remaining}`\n"
+                        f"• 📈 **Milestone Batch:** `{clone_state.get('batch_count', 0)}/60`\n"
+                        f"• 📊 **Overall Progress:** `[{bar}]` **{percentage:.1f}%**\n\n"
+                        f"_Current Message ID: `{msg.id}`_",
+                        buttons=[
+                            [Button.inline("⏸️ Pause", b"clone_pause"), Button.inline("🛑 Stop", b"clone_stop")]
+                        ] if bot_client else None
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to edit overall status message: {e}")
+            else:
+                skipped_count_since_update += 1
             
             if has_media:
                 if is_private:
