@@ -1264,7 +1264,16 @@ async def main():
     print("Connecting to Telegram Userbot...")
     
     # client.start() automatically handles OTP login in the terminal if session doesn't exist
-    await client.start()
+    try:
+        await client.start()
+    except FloodWaitError as e:
+        print("\n" + "="*60)
+        print(f"⚠️ WARNING: Userbot client hit Telegram FloodWait during startup!")
+        print(f"Need to wait {e.seconds} seconds before userbot can connect.")
+        print("Sleeping to satisfy the rate limit...")
+        print("="*60 + "\n")
+        await asyncio.sleep(e.seconds)
+        await client.start()
     
     me = await client.get_me()
     print("\n" + "="*60)
@@ -1285,7 +1294,17 @@ async def main():
     if bot_token:
         print("Connecting to Telegram Controller Bot...")
         bot_client = TelegramClient("bot", API_ID, API_HASH)
-        await bot_client.start(bot_token=bot_token)
+        try:
+            await bot_client.start(bot_token=bot_token)
+        except FloodWaitError as e:
+            print("\n" + "="*60)
+            print(f"⚠️ WARNING: Bot client hit Telegram FloodWait during startup!")
+            print(f"Need to wait {e.seconds} seconds before bot can connect.")
+            print("Sleeping to satisfy the rate limit...")
+            print("="*60 + "\n")
+            await asyncio.sleep(e.seconds)
+            await bot_client.start(bot_token=bot_token)
+            
         bot_me = await bot_client.get_me()
         
         print("\n" + "="*60)
