@@ -60,9 +60,11 @@ UPLOAD_CHAT_ENTITY = 'me'
 # Chronological cloning state configuration
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clone_state.json")
 clone_state = {}
+userbot_progress_msg = None
 active_clone_task = None
 
 async def safe_edit_msg(msg, text, buttons=None):
+    global userbot_progress_msg
     if not msg:
         return None
     try:
@@ -73,14 +75,43 @@ async def safe_edit_msg(msg, text, buttons=None):
             return await msg.respond(text, buttons=buttons)
         except Exception as ex:
             logger.error(f"Failed fallback respond call: {ex}")
-            return msg
+            # Bot client is completely rate-limited on both edits & sends. 
+            # Fallback: use Userbot to post progress directly into the target upload chat!
+            try:
+                if userbot_progress_msg:
+                    try:
+                        new_msg = await userbot_progress_msg.edit(text)
+                        if new_msg:
+                            userbot_progress_msg = new_msg
+                        return new_msg
+                    except Exception:
+                        pass
+                userbot_progress_msg = await client.send_message(UPLOAD_CHAT_ENTITY, text)
+                return userbot_progress_msg
+            except Exception as uex:
+                logger.error(f"Failed userbot fallback progress notification: {uex}")
+                return msg
     except Exception as e:
         logger.warning(f"Failed to edit message: {e}. Falling back to sending a new message.")
         try:
             return await msg.respond(text, buttons=buttons)
         except Exception as ex:
             logger.error(f"Failed fallback respond call: {ex}")
-            return msg
+            # Bot client is rate-limited. Fallback: use Userbot to post progress directly into the target upload chat!
+            try:
+                if userbot_progress_msg:
+                    try:
+                        new_msg = await userbot_progress_msg.edit(text)
+                        if new_msg:
+                            userbot_progress_msg = new_msg
+                        return new_msg
+                    except Exception:
+                        pass
+                userbot_progress_msg = await client.send_message(UPLOAD_CHAT_ENTITY, text)
+                return userbot_progress_msg
+            except Exception as uex:
+                logger.error(f"Failed userbot fallback progress notification: {uex}")
+                return msg
 
 async def safe_cancel_active_task():
     global active_clone_task
@@ -584,7 +615,7 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
         return False
 
 async def run_clone_loop(status_msg):
-    global clone_state, active_clone_task
+    global clone_state, active_clone_task, userbot_progress_msg
     try:
         source_chat = clone_state.get("source_chat_id")
         is_private = clone_state.get("is_private")
@@ -815,6 +846,14 @@ async def run_clone_loop(status_msg):
                 except Exception:
                     pass
                     
+            # Clean up the userbot fallback progress message if it was created
+            if userbot_progress_msg:
+                try:
+                    await userbot_progress_msg.delete()
+                except Exception:
+                    pass
+                userbot_progress_msg = None
+                    
             # Successful complete
             if clone_state.get("status") == "running":
                 clone_state["status"] = "completed"
@@ -841,6 +880,12 @@ async def run_clone_loop(status_msg):
                     await file_status_msg.delete()
                 except Exception:
                     pass
+            if userbot_progress_msg:
+                try:
+                    await userbot_progress_msg.delete()
+                except Exception:
+                    pass
+                userbot_progress_msg = None
             raise inner_e
             
     except Exception as e:
