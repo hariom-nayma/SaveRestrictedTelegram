@@ -320,7 +320,9 @@ class ProgressTracker:
         
         try:
             # Edit the status message safely
-            await self.status_msg.edit(text)
+            new_msg = await safe_edit_msg(self.status_msg, text)
+            if new_msg:
+                self.status_msg = new_msg
         except Exception:
             # Silently ignore errors (e.g. message text not changed, or quick FloodWait)
             pass
@@ -342,7 +344,7 @@ def parse_telegram_link(link: str):
     else:
         return False, public_username, message_id
 
-async def download_and_upload_video(chat_entity, message_id: int, status_msg, link_str: str, batch_info=(1, 1)):
+async def download_and_upload_video(chat_entity, message_id: int, status_msg, link_str: str, batch_info=(1, 1), file_status_msg=None):
     """Downloads a video message locally and uploads it back to Saved Messages.
     Returns: True if success, False otherwise.
     """
@@ -368,18 +370,29 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
             is_multi = True
     except (ValueError, TypeError):
         is_multi = True
-
+ 
     file_path = None
     thumb_path = None
-    file_status_msg = None
+    created_here = False
     
     try:
         if is_multi:
-            # Create a separate message for the current file's progress
-            file_status_msg = await status_msg.respond(f"🔍 {batch_str}Fetching message metadata for ID `{message_id}`...")
+            if not file_status_msg:
+                # Fallback to editing status_msg if possible
+                file_status_msg = await safe_edit_msg(status_msg, f"🔍 {batch_str}Fetching message metadata for ID `{message_id}`...")
+                if not file_status_msg:
+                    # Fallback to respond if edit fails
+                    file_status_msg = await status_msg.respond(f"🔍 {batch_str}Fetching message metadata for ID `{message_id}`...")
+                    created_here = True
+            else:
+                new_msg = await safe_edit_msg(file_status_msg, f"🔍 {batch_str}Fetching message metadata for ID `{message_id}`...")
+                if new_msg:
+                    file_status_msg = new_msg
         else:
             file_status_msg = status_msg
-            await file_status_msg.edit(f"🔍 {batch_str}Fetching message metadata for ID `{message_id}`...")
+            new_msg = await safe_edit_msg(file_status_msg, f"🔍 {batch_str}Fetching message metadata for ID `{message_id}`...")
+            if new_msg:
+                file_status_msg = new_msg
 
         # 1. Fetch the message
         msg = await client.get_messages(chat_entity, ids=message_id)
@@ -502,8 +515,8 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
         if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
             
-        # Delete the file progress message to keep chat clean
-        if is_multi and file_status_msg:
+        # Delete the file progress message only if we created it here
+        if created_here and file_status_msg:
             try:
                 await file_status_msg.delete()
             except Exception:
@@ -656,146 +669,179 @@ async def run_clone_loop(status_msg):
         
         last_overall_update_time = 0
         skipped_count_since_update = 0
+        file_status_msg = None
         
-        async for msg in client.iter_messages(chat_entity, min_id=min_id, reverse=True):
-            # Check if task was paused/stopped
-            if clone_state.get("status") in ("paused", "stopped"):
-                logger.info("Clone loop paused/stopped by user action.")
-                break
-                
-            # Analytics calculation
-            latest_id = int(clone_state.get("latest_msg_id", start_msg_id))
-            total_to_process = max(1, latest_id - start_msg_id + 1)
-            current_position = int(msg.id) - start_msg_id + 1
-            remaining = max(0, latest_id - int(msg.id))
-            percentage = min(100.0, max(0.0, (current_position / total_to_process) * 100))
-            
-            # Premium ASCII progress bar
-            bar_length = 12
-            filled_length = int(round(bar_length * percentage / 100.0))
-            bar = '█' * filled_length + '░' * (bar_length - filled_length)
-            
-            # Check if message has media
-            has_media = msg.media is not None
-            
-            # Show live stats in edit
-            dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
-            
-            now = time.time()
-            # Only update overall status if:
-            # - It's the first run (last_overall_update_time == 0)
-            # - OR we are about to download/upload media (has_media is True)
-            # - OR 12 seconds have passed since the last edit
-            # - OR we have skipped 10 messages since the last edit
-            should_edit_status = False
-            if last_overall_update_time == 0 or has_media:
-                should_edit_status = True
-            elif now - last_overall_update_time >= 12.0:
-                should_edit_status = True
-            elif skipped_count_since_update >= 10:
-                should_edit_status = True
-
-            if should_edit_status:
-                last_overall_update_time = now
-                skipped_count_since_update = 0
-                try:
-                    await status_msg.edit(
-                        f"🔄 **Cloning Channel in Progress...**\n\n"
-                        f"📊 **Clone Analytics:**\n"
-                        f"• 📁 **Source Chat:** `{source_chat}`\n"
-                        f"• 📥 **Destination:** `{dest_desc}`\n"
-                        f"• 🎥 **Videos Cloned:** `{clone_state.get('total_cloned', 0)}`\n"
-                        f"• ⏩ **Skipped (No Media):** `{clone_state.get('total_skipped', 0)}`\n"
-                        f"• ⏳ **Messages Remaining:** `{remaining}`\n"
-                        f"• 📈 **Milestone Batch:** `{clone_state.get('batch_count', 0)}/60`\n"
-                        f"• 📊 **Overall Progress:** `[{bar}]` **{percentage:.1f}%**\n\n"
-                        f"_Current Message ID: `{msg.id}`_",
-                        buttons=[
-                            [Button.inline("⏸️ Pause", b"clone_pause"), Button.inline("🛑 Stop", b"clone_stop")]
-                        ] if bot_client else None
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to edit overall status message: {e}")
-            else:
-                skipped_count_since_update += 1
-            
-            if has_media:
-                if is_private:
-                    msg_link = f"https://t.me/c/{source_chat}/{msg.id}"
-                else:
-                    msg_link = f"https://t.me/{source_chat}/{msg.id}"
+        try:
+            async for msg in client.iter_messages(chat_entity, min_id=min_id, reverse=True):
+                # Check if task was paused/stopped
+                if clone_state.get("status") in ("paused", "stopped"):
+                    logger.info("Clone loop paused/stopped by user action.")
+                    break
                     
-                success = await download_and_upload_video(
-                    chat_entity,
-                    msg.id,
-                    status_msg,
-                    msg_link,
-                    batch_info=(clone_state.get("total_cloned", 0) + 1, "Ongoing")
-                )
+                # Analytics calculation
+                latest_id = int(clone_state.get("latest_msg_id", start_msg_id))
+                total_to_process = max(1, latest_id - start_msg_id + 1)
+                current_position = int(msg.id) - start_msg_id + 1
+                remaining = max(0, latest_id - int(msg.id))
+                percentage = min(100.0, max(0.0, (current_position / total_to_process) * 100))
                 
-                if success:
-                    clone_state["total_cloned"] = clone_state.get("total_cloned", 0) + 1
-                    clone_state["batch_count"] = clone_state.get("batch_count", 0) + 1
+                # Premium ASCII progress bar
+                bar_length = 12
+                filled_length = int(round(bar_length * percentage / 100.0))
+                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                
+                # Check if message has media
+                has_media = msg.media is not None
+                
+                # Show live stats in edit
+                dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
+                
+                now = time.time()
+                # Only update overall status if:
+                # - It's the first run (last_overall_update_time == 0)
+                # - OR we are about to download/upload media (has_media is True)
+                # - OR 12 seconds have passed since the last edit
+                # - OR we have skipped 10 messages since the last edit
+                should_edit_status = False
+                if last_overall_update_time == 0 or has_media:
+                    should_edit_status = True
+                elif now - last_overall_update_time >= 12.0:
+                    should_edit_status = True
+                elif skipped_count_since_update >= 10:
+                    should_edit_status = True
+
+                if should_edit_status:
+                    last_overall_update_time = now
+                    skipped_count_since_update = 0
+                    try:
+                        new_msg = await safe_edit_msg(
+                            status_msg,
+                            f"🔄 **Cloning Channel in Progress...**\n\n"
+                            f"📊 **Clone Analytics:**\n"
+                            f"• 📁 **Source Chat:** `{source_chat}`\n"
+                            f"• 📥 **Destination:** `{dest_desc}`\n"
+                            f"• 🎥 **Videos Cloned:** `{clone_state.get('total_cloned', 0)}`\n"
+                            f"• ⏩ **Skipped (No Media):** `{clone_state.get('total_skipped', 0)}`\n"
+                            f"• ⏳ **Messages Remaining:** `{remaining}`\n"
+                            f"• 📈 **Milestone Batch:** `{clone_state.get('batch_count', 0)}/60`\n"
+                            f"• 📊 **Overall Progress:** `[{bar}]` **{percentage:.1f}%**\n\n"
+                            f"_Current Message ID: `{msg.id}`_",
+                            buttons=[
+                                [Button.inline("⏸️ Pause", b"clone_pause"), Button.inline("🛑 Stop", b"clone_stop")]
+                            ] if bot_client else None
+                        )
+                        if new_msg:
+                            status_msg = new_msg
+                    except Exception as e:
+                        logger.warning(f"Failed to edit overall status message: {e}")
+                else:
+                    skipped_count_since_update += 1
+                
+                if has_media:
+                    if is_private:
+                        msg_link = f"https://t.me/c/{source_chat}/{msg.id}"
+                    else:
+                        msg_link = f"https://t.me/{source_chat}/{msg.id}"
+                        
+                    # Initialize the persistent separate progress message if not already done
+                    if not file_status_msg:
+                        try:
+                            # Try to send a new status message
+                            file_status_msg = await status_msg.respond("🔄 **Initializing file progress stream...**")
+                        except Exception as e:
+                            logger.warning(f"Could not create separate progress message due to error: {e}. Reusing overall status message.")
+                            
+                    # Pass either file_status_msg or status_msg (as fallback)
+                    active_progress_msg = file_status_msg if file_status_msg else status_msg
+                    
+                    success = await download_and_upload_video(
+                        chat_entity,
+                        msg.id,
+                        status_msg,
+                        msg_link,
+                        batch_info=(clone_state.get("total_cloned", 0) + 1, "Ongoing"),
+                        file_status_msg=active_progress_msg
+                    )
+                    
+                    if success:
+                        clone_state["total_cloned"] = clone_state.get("total_cloned", 0) + 1
+                        clone_state["batch_count"] = clone_state.get("batch_count", 0) + 1
+                    else:
+                        clone_state["total_skipped"] = clone_state.get("total_skipped", 0) + 1
                 else:
                     clone_state["total_skipped"] = clone_state.get("total_skipped", 0) + 1
-            else:
-                clone_state["total_skipped"] = clone_state.get("total_skipped", 0) + 1
-                
-            clone_state["last_processed_id"] = msg.id
-            save_clone_state()
-            
-            # Milestone Throttling
-            if clone_state.get("batch_count", 0) >= 60:
-                clone_state["batch_count"] = 0
+                    
+                clone_state["last_processed_id"] = msg.id
                 save_clone_state()
                 
-                sleep_time = random.randint(300, 600)
-                logger.info(f"60 videos milestone reached. Sleeping for {sleep_time} seconds...")
-                
-                # Sleep in increments of 5 seconds to support responsive pausing
-                for elapsed in range(0, sleep_time, 5):
+                # Milestone Throttling
+                if clone_state.get("batch_count", 0) >= 60:
+                    clone_state["batch_count"] = 0
+                    save_clone_state()
+                    
+                    sleep_time = random.randint(300, 600)
+                    logger.info(f"60 videos milestone reached. Sleeping for {sleep_time} seconds...")
+                    
+                    # Sleep in increments of 5 seconds to support responsive pausing
+                    for elapsed in range(0, sleep_time, 5):
+                        if clone_state.get("status") in ("paused", "stopped"):
+                            break
+                        remaining_sleep = sleep_time - elapsed
+                        new_msg = await safe_edit_msg(
+                            status_msg,
+                            f"💤 **Milestone Cooldown (60 Videos Completed)**\n\n"
+                            f"Sleeping to prevent Telegram flood/ban restrictions.\n"
+                            f"⏳ **Time Remaining:** `{remaining_sleep // 60}m {remaining_sleep % 60}s`\n"
+                            f"📊 **Total Videos Cloned:** `{clone_state.get('total_cloned', 0)}`\n\n"
+                            f"_System is resting safely..._",
+                            buttons=[
+                                [Button.inline("⏸️ Pause", b"clone_pause"), Button.inline("🛑 Stop", b"clone_stop")]
+                            ] if bot_client else None
+                        )
+                        if new_msg:
+                            status_msg = new_msg
+                        await asyncio.sleep(5)
+                        
                     if clone_state.get("status") in ("paused", "stopped"):
                         break
-                    remaining_sleep = sleep_time - elapsed
-                    new_msg = await safe_edit_msg(
-                        status_msg,
-                        f"💤 **Milestone Cooldown (60 Videos Completed)**\n\n"
-                        f"Sleeping to prevent Telegram flood/ban restrictions.\n"
-                        f"⏳ **Time Remaining:** `{remaining_sleep // 60}m {remaining_sleep % 60}s`\n"
-                        f"📊 **Total Videos Cloned:** `{clone_state.get('total_cloned', 0)}`\n\n"
-                        f"_System is resting safely..._",
-                        buttons=[
-                            [Button.inline("⏸️ Pause", b"clone_pause"), Button.inline("🛑 Stop", b"clone_stop")]
-                        ] if bot_client else None
-                    )
-                    if new_msg:
-                        status_msg = new_msg
-                    await asyncio.sleep(5)
+                else:
+                    # Polite delay between iterations
+                    await asyncio.sleep(3.0)
                     
-                if clone_state.get("status") in ("paused", "stopped"):
-                    break
-            else:
-                # Polite delay between iterations
-                await asyncio.sleep(3.0)
+            # Clean up the persistent separate progress message if it was created
+            if file_status_msg:
+                try:
+                    await file_status_msg.delete()
+                except Exception:
+                    pass
+                    
+            # Successful complete
+            if clone_state.get("status") == "running":
+                clone_state["status"] = "completed"
+                save_clone_state()
+                await safe_edit_msg(
+                    status_msg,
+                    f"✅ **Cloning Completed Successfully!**\n\n"
+                    f"📊 **Final Analytics:**\n"
+                    f"• 📁 **Source Chat:** `{source_chat}`\n"
+                    f"• 🎥 **Videos Cloned:** `{clone_state.get('total_cloned', 0)}`\n"
+                    f"• ⏩ **Skipped (No Media):** `{clone_state.get('total_skipped', 0)}`\n\n"
+                    f"All messages in this channel have been processed!",
+                    buttons=None
+                )
+                # Remove clone state file on success
+                if os.path.exists(STATE_FILE):
+                    os.remove(STATE_FILE)
+                clone_state.clear()
                 
-        # Successful complete
-        if clone_state.get("status") == "running":
-            clone_state["status"] = "completed"
-            save_clone_state()
-            await safe_edit_msg(
-                status_msg,
-                f"✅ **Cloning Completed Successfully!**\n\n"
-                f"📊 **Final Analytics:**\n"
-                f"• 📁 **Source Chat:** `{source_chat}`\n"
-                f"• 🎥 **Videos Cloned:** `{clone_state.get('total_cloned', 0)}`\n"
-                f"• ⏩ **Skipped (No Media):** `{clone_state.get('total_skipped', 0)}`\n\n"
-                f"All messages in this channel have been processed!",
-                buttons=None
-            )
-            # Remove clone state file on success
-            if os.path.exists(STATE_FILE):
-                os.remove(STATE_FILE)
-            clone_state.clear()
+        except Exception as inner_e:
+            # Clean up progress message if exception raised inside the iteration loop
+            if file_status_msg:
+                try:
+                    await file_status_msg.delete()
+                except Exception:
+                    pass
+            raise inner_e
             
     except Exception as e:
         import traceback
