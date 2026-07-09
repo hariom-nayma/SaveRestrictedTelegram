@@ -62,6 +62,26 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clone_sta
 clone_state = {}
 active_clone_task = None
 
+async def safe_edit_msg(msg, text, buttons=None):
+    if not msg:
+        return None
+    try:
+        return await msg.edit(text, buttons=buttons)
+    except FloodWaitError as e:
+        logger.warning(f"Failed to edit message due to FloodWait ({e.seconds}s). Falling back to sending a new message.")
+        try:
+            return await msg.respond(text, buttons=buttons)
+        except Exception as ex:
+            logger.error(f"Failed fallback respond call: {ex}")
+            return msg
+    except Exception as e:
+        logger.warning(f"Failed to edit message: {e}. Falling back to sending a new message.")
+        try:
+            return await msg.respond(text, buttons=buttons)
+        except Exception as ex:
+            logger.error(f"Failed fallback respond call: {ex}")
+            return msg
+
 async def safe_cancel_active_task():
     global active_clone_task
     if active_clone_task and not active_clone_task.done():
@@ -564,10 +584,10 @@ async def run_clone_loop(status_msg):
         
     if not source_chat or start_msg_id is None:
         logger.error("Source chat or start message ID missing from clone state.")
-        await status_msg.edit("❌ **Error:** Invalid clone state configuration.")
+        await safe_edit_msg(status_msg, "❌ **Error:** Invalid clone state configuration.")
         return
         
-    await status_msg.edit("🔄 **Step 1/3: Resolving source channel entity...**")
+    status_msg = await safe_edit_msg(status_msg, "🔄 **Step 1/3: Resolving source channel entity...**")
     
     # 1. Resolve source chat entity (Directly try standard resolution first to save time and network calls)
     chat_entity = None
@@ -575,38 +595,38 @@ async def run_clone_loop(status_msg):
         if is_private:
             # Try to resolve using full channel ID with -100 prefix first (very reliable if already joined/cached)
             try:
-                chat_entity = await client.get_entity(int(f"-100{source_chat}"))
+                chat_entity = await asyncio.wait_for(client.get_entity(int(f"-100{source_chat}")), timeout=15)
             except Exception:
                 peer = PeerChannel(int(source_chat))
-                chat_entity = await client.get_entity(peer)
+                chat_entity = await asyncio.wait_for(client.get_entity(peer), timeout=15)
         else:
-            chat_entity = await client.get_entity(source_chat)
+            chat_entity = await asyncio.wait_for(client.get_entity(source_chat), timeout=15)
     except Exception as e:
         # Fallback: only fetch recent dialogs if direct resolution fails
         logger.info(f"Direct resolution failed ({e}). Refreshing recent dialogs as fallback...")
-        await status_msg.edit("🔄 **Step 1/3: Channel not cached. Fetching recent dialogs as fallback...**")
+        status_msg = await safe_edit_msg(status_msg, "🔄 **Step 1/3: Channel not cached. Fetching recent dialogs as fallback...**")
         try:
             # Limit dialogs to most recent 80 to make it extremely fast and lightweight
-            await client.get_dialogs(limit=80)
+            await asyncio.wait_for(client.get_dialogs(limit=80), timeout=20)
             if is_private:
                 try:
-                    chat_entity = await client.get_entity(int(f"-100{source_chat}"))
+                    chat_entity = await asyncio.wait_for(client.get_entity(int(f"-100{source_chat}")), timeout=15)
                 except Exception:
                     peer = PeerChannel(int(source_chat))
-                    chat_entity = await client.get_entity(peer)
+                    chat_entity = await asyncio.wait_for(client.get_entity(peer), timeout=15)
             else:
-                chat_entity = await client.get_entity(source_chat)
+                chat_entity = await asyncio.wait_for(client.get_entity(source_chat), timeout=15)
         except Exception as err:
             clone_state["status"] = "stopped"
             save_clone_state()
-            await status_msg.edit(f"❌ **Failed to access source channel:** `{str(err)}`\nMake sure your account is a member of the channel.")
+            await safe_edit_msg(status_msg, f"❌ **Failed to access source channel:** `{str(err)}`\nMake sure your account is a member of the channel.")
             return
 
-    await status_msg.edit("🔄 **Step 2/3: Fetching latest message details...**")
+    status_msg = await safe_edit_msg(status_msg, "🔄 **Step 2/3: Fetching latest message details...**")
 
     # 2. Retrieve the latest message ID to calculate progress and messages remaining
     try:
-        latest_msgs = await client.get_messages(chat_entity, limit=1)
+        latest_msgs = await asyncio.wait_for(client.get_messages(chat_entity, limit=1), timeout=15)
         if latest_msgs:
             clone_state["latest_msg_id"] = int(latest_msgs[0].id)
         else:
@@ -615,7 +635,7 @@ async def run_clone_loop(status_msg):
         logger.warning(f"Could not retrieve latest message ID: {e}")
         clone_state["latest_msg_id"] = int(start_msg_id)
         
-    await status_msg.edit("🔄 **Step 3/3: Initializing chronological download stream...**")
+    status_msg = await safe_edit_msg(status_msg, "🔄 **Step 3/3: Initializing chronological download stream...**")
     
     # Determine starting message ID
     try:
@@ -737,7 +757,8 @@ async def run_clone_loop(status_msg):
                     if clone_state.get("status") in ("paused", "stopped"):
                         break
                     remaining_sleep = sleep_time - elapsed
-                    await status_msg.edit(
+                    new_msg = await safe_edit_msg(
+                        status_msg,
                         f"💤 **Milestone Cooldown (60 Videos Completed)**\n\n"
                         f"Sleeping to prevent Telegram flood/ban restrictions.\n"
                         f"⏳ **Time Remaining:** `{remaining_sleep // 60}m {remaining_sleep % 60}s`\n"
@@ -747,6 +768,8 @@ async def run_clone_loop(status_msg):
                             [Button.inline("⏸️ Pause", b"clone_pause"), Button.inline("🛑 Stop", b"clone_stop")]
                         ] if bot_client else None
                     )
+                    if new_msg:
+                        status_msg = new_msg
                     await asyncio.sleep(5)
                     
                 if clone_state.get("status") in ("paused", "stopped"):
@@ -759,7 +782,8 @@ async def run_clone_loop(status_msg):
         if clone_state.get("status") == "running":
             clone_state["status"] = "completed"
             save_clone_state()
-            await status_msg.edit(
+            await safe_edit_msg(
+                status_msg,
                 f"✅ **Cloning Completed Successfully!**\n\n"
                 f"📊 **Final Analytics:**\n"
                 f"• 📁 **Source Chat:** `{source_chat}`\n"
