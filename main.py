@@ -1049,6 +1049,65 @@ async def handle_new_message(event):
         )
         return
 
+    # --- Command: Clone Channel (via Userbot) ---
+    if text.startswith("/clone"):
+        command_args = text.split()
+        if len(command_args) < 2:
+            await event.reply(
+                "❌ **Usage:** `/clone <link_of_any_message_of_the_channel> [-f]`\n\n"
+                "Example:\n`/clone https://t.me/c/12345/100 -f`"
+            )
+            return
+            
+        force_start = False
+        link = None
+        for arg in command_args[1:]:
+            if arg in ("-f", "--force"):
+                force_start = True
+            else:
+                link = arg
+                
+        if not link:
+            await event.reply("❌ **Error:** Please provide a valid Telegram message link.")
+            return
+
+        if not force_start:
+            await event.reply("❌ **Error:** Interactive mode with buttons is not supported directly in Saved Messages. Please add `-f` to force start, e.g.:\n`/clone " + link + " -f`")
+            return
+
+        parsed = parse_telegram_link(link)
+        if not parsed:
+            await event.reply("❌ **Invalid Link:** Please provide a valid Telegram message link from the channel.")
+            return
+            
+        is_private, chat_identifier, message_id = parsed
+        
+        # Check if clone is already running
+        if active_clone_task and not active_clone_task.done() and clone_state.get("status") == "running":
+            await event.reply("⚠️ **Another clone task is currently in progress.** Please pause or stop it first.")
+            return
+            
+        # Load clone state
+        load_clone_state()
+        
+        # Force start fresh clone
+        clone_state.update({
+            "source_chat_id": str(chat_identifier),
+            "is_private": is_private,
+            "start_msg_id": message_id,
+            "last_processed_id": None,
+            "total_cloned": 0,
+            "total_skipped": 0,
+            "status": "running",
+            "batch_count": 0
+        })
+        save_clone_state()
+        
+        await safe_cancel_active_task()
+        msg = await event.reply("🔄 **Starting fresh clone process (Forced via Userbot)...**")
+        active_clone_task = asyncio.create_task(run_clone_loop(msg))
+        return
+
     # --- Direct Single Link Processing ---
     parsed = parse_telegram_link(text)
     if parsed:
@@ -1115,15 +1174,27 @@ async def handle_bot_message(event):
 
     # Command: /clone
     if text.startswith("/clone"):
-        parts = text.split(maxsplit=1)
-        if len(parts) != 2:
+        command_args = text.split()
+        if len(command_args) < 2:
             await event.reply(
-                "❌ **Usage:** `/clone <link_of_any_message_of_the_channel>`\n\n"
-                "Example:\n`/clone https://t.me/c/12345/100`"
+                "❌ **Usage:** `/clone <link_of_any_message_of_the_channel> [-f]`\n\n"
+                "Example:\n`/clone https://t.me/c/12345/100` (interactive)\n"
+                "`/clone https://t.me/c/12345/100 -f` (force start fresh immediately)"
             )
             return
             
-        link = parts[1].strip()
+        force_start = False
+        link = None
+        for arg in command_args[1:]:
+            if arg in ("-f", "--force"):
+                force_start = True
+            else:
+                link = arg
+                
+        if not link:
+            await event.reply("❌ **Error:** Please provide a valid Telegram message link.")
+            return
+
         parsed = parse_telegram_link(link)
         if not parsed:
             await event.reply("❌ **Invalid Link:** Please provide a valid Telegram message link from the channel.")
@@ -1136,11 +1207,31 @@ async def handle_bot_message(event):
             await event.reply("⚠️ **Another clone task is currently in progress.** Please pause or stop it first.")
             return
             
-        # Load clone state and check if it's the same channel
+        # Load clone state
         load_clone_state()
         
         dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
         
+        if force_start:
+            # Force start fresh clone
+            clone_state.update({
+                "source_chat_id": str(chat_identifier),
+                "is_private": is_private,
+                "start_msg_id": message_id,
+                "last_processed_id": None,
+                "total_cloned": 0,
+                "total_skipped": 0,
+                "status": "running",
+                "batch_count": 0
+            })
+            save_clone_state()
+            
+            await safe_cancel_active_task()
+            msg = await event.reply("🔄 **Starting fresh clone process (Forced)...**")
+            active_clone_task = asyncio.create_task(run_clone_loop(msg))
+            return
+            
+        # Interactive mode
         if clone_state.get("source_chat_id") == str(chat_identifier):
             buttons = [
                 [Button.inline("⏯️ Resume", b"clone_resume"), Button.inline("🆕 Start Fresh", b"clone_fresh")],
