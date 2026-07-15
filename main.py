@@ -62,6 +62,7 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clone_sta
 clone_state = {}
 userbot_progress_msg = None
 active_clone_task = None
+SILENT_MODE = os.getenv("SILENT_MODE", "False").lower() in ("true", "1", "yes")
 
 async def safe_edit_msg(msg, text, buttons=None):
     global userbot_progress_msg
@@ -299,6 +300,10 @@ class ProgressTracker:
         self.last_percentage = 0.0
 
     async def progress_callback(self, current, total):
+        global SILENT_MODE
+        if SILENT_MODE:
+            return
+            
         if not total:
             return
             
@@ -307,8 +312,8 @@ class ProgressTracker:
         time_elapsed = now - self.last_update_time
         percent_diff = percentage - self.last_percentage
         
-        # Throttled progress update: max once every 5.0 seconds and at least 10% change OR when complete
-        if current < total and (time_elapsed < 5.0 or percent_diff < 10.0):
+        # Throttled progress update: max once every 8.0 seconds and at least 15% change OR when complete
+        if current < total and (time_elapsed < 8.0 or percent_diff < 15.0):
             return
             
         self.last_update_time = now
@@ -730,18 +735,17 @@ async def run_clone_loop(status_msg):
                 now = time.time()
                 # Only update overall status if:
                 # - It's the first run (last_overall_update_time == 0)
-                # - OR we are about to download/upload media (has_media is True)
-                # - OR 12 seconds have passed since the last edit
-                # - OR we have skipped 10 messages since the last edit
+                # - OR 15 seconds have passed since the last edit
+                # - OR we have skipped 20 messages since the last edit
                 should_edit_status = False
-                if last_overall_update_time == 0 or has_media:
+                if last_overall_update_time == 0:
                     should_edit_status = True
-                elif now - last_overall_update_time >= 12.0:
+                elif now - last_overall_update_time >= 15.0:
                     should_edit_status = True
-                elif skipped_count_since_update >= 10:
+                elif skipped_count_since_update >= 20:
                     should_edit_status = True
 
-                if should_edit_status:
+                if should_edit_status and not SILENT_MODE:
                     last_overall_update_time = now
                     skipped_count_since_update = 0
                     try:
@@ -917,10 +921,25 @@ async def run_clone_loop(status_msg):
             except Exception as ex:
                 logger.error(f"Failed to send clone loop error fallback message: {ex}")
 
+def handle_flood_wait_decorator(func):
+    async def wrapper(event, *args, **kwargs):
+        try:
+            return await func(event, *args, **kwargs)
+        except FloodWaitError as e:
+            logger.warning(f"Hit FloodWait in {func.__name__}: must wait {e.seconds} seconds.")
+            try:
+                await event.reply(f"⚠️ **Throttled by Telegram:** The service is rate-limited. Please wait `{e.seconds}` seconds before trying again.")
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {e}", exc_info=True)
+    return wrapper
+
 # Event Handler: Listen to all incoming messages from yourself in Saved Messages
 @client.on(events.NewMessage(chats='me'))
-
+@handle_flood_wait_decorator
 async def handle_new_message(event):
+    global SILENT_MODE
     text = event.raw_text.strip()
     if not text:
         return
@@ -935,6 +954,18 @@ async def handle_new_message(event):
     if text == "/refresh":
         status = await event.reply("🔄 **Refreshing bot configuration & connection...**")
         await refresh_bot(status)
+        return
+
+    # --- Command: Silent Mode / Hide ---
+    if text in ("/silent", "/hide"):
+        SILENT_MODE = True
+        await event.reply("🔇 **Silent Mode Enabled.** Progress updates and progress bars are now hidden to prevent rate limits.")
+        return
+
+    # --- Command: Show / Verbose ---
+    if text in ("/show", "/verbose"):
+        SILENT_MODE = False
+        await event.reply("🔊 **Silent Mode Disabled.** Progress updates and progress bars are now visible.")
         return
 
     # --- Command: Batch Download ---
@@ -1048,8 +1079,9 @@ async def handle_new_message(event):
         if success:
             await status.delete()  # Remove progress message on full success
 
+@handle_flood_wait_decorator
 async def handle_bot_message(event):
-    global active_clone_task, clone_state
+    global active_clone_task, clone_state, SILENT_MODE
     if not event.is_private:
         return
         
@@ -1067,6 +1099,18 @@ async def handle_bot_message(event):
     if text == "/refresh":
         status = await event.reply("🔄 **Refreshing bot configuration & connection...**")
         await refresh_bot(status)
+        return
+
+    # Command: /silent or /hide
+    if text in ("/silent", "/hide"):
+        SILENT_MODE = True
+        await event.reply("🔇 **Silent Mode Enabled.** Progress updates and progress bars are now hidden to prevent rate limits.")
+        return
+
+    # Command: /show or /verbose
+    if text in ("/show", "/verbose"):
+        SILENT_MODE = False
+        await event.reply("🔊 **Silent Mode Disabled.** Progress updates and progress bars are now visible.")
         return
 
     # Command: /clone
@@ -1148,6 +1192,8 @@ async def handle_bot_message(event):
             "• `/clone <message_link>` - Start interactive channel cloning starting from any message\n"
             "• `/restart` - Restart the bot process completely\n"
             "• `/refresh` - Reload configuration and refresh client connection\n"
+            "• `/silent` (or `/hide`) - Hide transfer progress updates (saves API limits)\n"
+            "• `/show` (or `/verbose`) - Show transfer progress updates\n"
             "• `/help` - Show this message\n\n"
             f"📥 **Current Upload Destination:** `{dest_desc}`"
         )
