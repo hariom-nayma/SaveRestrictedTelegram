@@ -64,6 +64,39 @@ userbot_progress_msg = None
 active_clone_task = None
 SILENT_MODE = os.getenv("SILENT_MODE", "False").lower() in ("true", "1", "yes")
 
+# Maximum file size limit in MB (None or <= 0 means unlimited)
+def get_env_max_size():
+    val = os.getenv("MAX_FILE_SIZE_MB")
+    if val:
+        try:
+            parsed = float(val)
+            return parsed if parsed > 0 else None
+        except ValueError:
+            return None
+    return None
+
+MAX_FILE_SIZE_MB = get_env_max_size()
+
+def parse_size_argument(arg_str: str):
+    """
+    Parses size strings like: '500', '500mb', '1.5gb', '2g', '0', 'off', 'disable', 'none'
+    Returns: float (size in MB) or None (for disabled/unlimited) or False (invalid)
+    """
+    arg = arg_str.strip().lower()
+    if arg in ("off", "0", "disable", "disabled", "none", "unlimited", "reset"):
+        return None
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*(mb|m|gb|g|kb|k)?$", arg)
+    if not match:
+        return False
+    num = float(match.group(1))
+    unit = match.group(2) or "mb"
+    if unit in ("gb", "g"):
+        return num * 1024.0
+    elif unit in ("kb", "k"):
+        return num / 1024.0
+    else:
+        return num
+
 async def safe_edit_msg(msg, text, buttons=None):
     global userbot_progress_msg
     if not msg:
@@ -337,21 +370,23 @@ class ProgressTracker:
         total_mb = total / (1024 * 1024)
         speed_mb = speed / (1024 * 1024)
         
-        # Build premium ASCII progress bar
+        # Build premium modern progress bar
         bar_length = 12
         filled_length = int(round(bar_length * current / float(total)))
-        bar = '█' * filled_length + '░' * (bar_length - filled_length)
+        bar = '▰' * filled_length + '▱' * (bar_length - filled_length)
         
         # Format the status message
-        batch_prefix = f"🔄 **[Batch: {self.current_item}/{self.total_items}]**\n" if not getattr(self, 'is_numeric', False) or getattr(self, 'total_items_val', 0) > 1 else ""
+        batch_prefix = f"📦 **Batch Item:** `{self.current_item}/{self.total_items}`\n" if not getattr(self, 'is_numeric', False) or getattr(self, 'total_items_val', 0) > 1 else ""
         
         text = (
             f"{batch_prefix}"
-            f"⚡ **{self.action_name}**\n\n"
-            f"📁 Progress: `[{bar}]` **{percentage:.1f}%**\n"
-            f"💾 Size: `{curr_mb:.2f} MB` / `{total_mb:.2f} MB`\n"
-            f"⚡ Speed: `{speed_mb:.2f} MB/s`\n"
-            f"⏳ ETA: `{eta_str}`"
+            f"⚡ **{self.action_name}**\n"
+            f"╭────────────────────────────\n"
+            f"│ 📊 `[{bar}]` **{percentage:.1f}%**\n"
+            f"│ 💾 **Size:** `{curr_mb:.2f} MB` / `{total_mb:.2f} MB`\n"
+            f"│ 🚀 **Speed:** `{speed_mb:.2f} MB/s`\n"
+            f"│ ⏱️ **ETA:** `{eta_str}`\n"
+            f"╰────────────────────────────"
         )
         
         try:
@@ -456,10 +491,29 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
         else:
             file_name = f"video_{message_id}{ext}"
             
+        # Clean file path
         file_path = os.path.join(DOWNLOAD_DIR, file_name)
         
+        # Check file size limit before downloading to protect storage and bandwidth
+        if msg.file and msg.file.size:
+            file_size_mb = msg.file.size / (1024 * 1024)
+            if MAX_FILE_SIZE_MB is not None and file_size_mb > MAX_FILE_SIZE_MB:
+                skip_msg = (
+                    f"⏭️ {batch_str}**Skipped Message `{message_id}` (Exceeds Size Limit)**\n"
+                    f"╭────────────────────────────\n"
+                    f"│ 📁 **File:** `{file_name}`\n"
+                    f"│ 📦 **Size:** `{file_size_mb:.2f} MB`\n"
+                    f"│ 🛑 **Limit:** `{MAX_FILE_SIZE_MB:.2f} MB`\n"
+                    f"│ 💡 **Tip:** Adjust via `/maxsize <MB>`\n"
+                    f"╰────────────────────────────\n"
+                    f"_Skipping safely to next item..._"
+                )
+                logger.info(f"Skipping msg {message_id} ({file_name}): size {file_size_mb:.2f} MB > max {MAX_FILE_SIZE_MB:.2f} MB")
+                await safe_edit_msg(file_status_msg, skip_msg)
+                return "skipped"
+
         # 2. Download Media chunk-by-chunk
-        logger.info(f"Starting download of file: {file_name} (Size: {msg.file.size} bytes)")
+        logger.info(f"Starting download of file: {file_name} (Size: {msg.file.size if msg.file else 'Unknown'} bytes)")
         tracker = ProgressTracker(file_status_msg, "📥 Downloading Video", total_items, current_item)
         
         start_t = time.time()
@@ -525,12 +579,15 @@ async def download_and_upload_video(chat_entity, message_id: int, status_msg, li
         dest_name = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else "Target Channel"
         tracker_upload = ProgressTracker(file_status_msg, f"📤 Uploading Video to {dest_name}", total_items, current_item)
         
+        file_size_display = f"{msg.file.size / (1024*1024):.2f} MB" if msg.file and msg.file.size else "Unknown"
         caption = (
-            f"🎥 **Restricted Video Downloaded**\n\n"
-            f"🔗 **Source Link:** [Click here]({link_str})\n"
-            f"📁 **File Name:** `{file_name}`\n"
-            f"📦 **Size:** `{msg.file.size / (1024*1024):.2f} MB`\n\n"
-            f"_Downloaded safely via SaveRestricted Userbot_"
+            f"🎬 **Restricted Content Decrypted**\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 **File:** `{file_name}`\n"
+            f"📦 **Size:** `{file_size_display}`\n"
+            f"🔗 **Source:** [Original Post]({link_str})\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ _Streamable MTProto Transfer_"
         )
         
         logger.info(f"Starting upload of file: {file_path}")
@@ -721,10 +778,10 @@ async def run_clone_loop(status_msg):
                 remaining = max(0, latest_id - int(msg.id))
                 percentage = min(100.0, max(0.0, (current_position / total_to_process) * 100))
                 
-                # Premium ASCII progress bar
+                # Premium modern progress bar
                 bar_length = 12
                 filled_length = int(round(bar_length * percentage / 100.0))
-                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                bar = '▰' * filled_length + '▱' * (bar_length - filled_length)
                 
                 # Check if message has media
                 has_media = msg.media is not None
@@ -798,7 +855,7 @@ async def run_clone_loop(status_msg):
                         file_status_msg=active_progress_msg
                     )
                     
-                    if success:
+                    if success is True:
                         clone_state["total_cloned"] = clone_state.get("total_cloned", 0) + 1
                         clone_state["batch_count"] = clone_state.get("batch_count", 0) + 1
                     else:
@@ -939,9 +996,108 @@ def handle_flood_wait_decorator(func):
 @client.on(events.NewMessage(chats='me'))
 @handle_flood_wait_decorator
 async def handle_new_message(event):
-    global SILENT_MODE
+    global SILENT_MODE, MAX_FILE_SIZE_MB
     text = event.raw_text.strip()
     if not text:
+        return
+
+    # --- Command: Help / Start ---
+    if text in ("/help", "/start"):
+        dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
+        limit_desc = f"`{MAX_FILE_SIZE_MB:.1f} MB`" if MAX_FILE_SIZE_MB else "`Unlimited`"
+        mode_desc = "`Silent (Muted)`" if SILENT_MODE else "`Verbose (Live bar)`"
+        
+        help_text = (
+            "🚀 **SaveRestricted Userbot — Control Center**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📥 **Send any restricted Telegram link directly to download it.**\n\n"
+            "⚡ **Available Commands:**\n"
+            "• `/batch <start_link> <end_link>`\n"
+            "  ↳ Sequentially save up to 60 messages from a channel\n"
+            "• `/maxsize <size>` (e.g. `/maxsize 500`, `/maxsize 1.5GB`)\n"
+            "  ↳ Set size threshold to safely skip oversized files\n"
+            "• `/maxsize off` — Disable size limit (unlimited)\n"
+            "• `/status` — View current bot limits & destination\n"
+            "• `/silent` or `/hide` — Mute live progress edits\n"
+            "• `/show` or `/verbose` — Enable live progress bars\n"
+            "• `/clone <link> -f` — Continuous channel cloning\n"
+            "• `/refresh` — Refresh connection & upload chat\n"
+            "• `/restart` — Full bot restart\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 **Upload Destination:** `{dest_desc}`\n"
+            f"🛑 **Current Max Size:** {limit_desc}\n"
+            f"🔇 **Progress Mode:** {mode_desc}"
+        )
+        await event.reply(help_text)
+        return
+
+    # --- Command: Status ---
+    if text == "/status":
+        dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
+        limit_desc = f"`{MAX_FILE_SIZE_MB:.1f} MB` (~`{MAX_FILE_SIZE_MB/1024:.2f} GB`)" if MAX_FILE_SIZE_MB else "`Disabled (Unlimited)`"
+        mode_desc = "🔇 `Silent (No edits)`" if SILENT_MODE else "📊 `Verbose (Live progress bar)`"
+        
+        status_text = (
+            "⚙️ **SaveRestricted System Status**\n"
+            "╭────────────────────────────\n"
+            f"│ 🟢 **Status:** Active & Listening\n"
+            f"│ 🎯 **Destination:** `{dest_desc}`\n"
+            f"│ 🛑 **Max File Size:** {limit_desc}\n"
+            f"│ 📈 **Progress Mode:** {mode_desc}\n"
+            "╰────────────────────────────\n"
+            "💡 _Use `/maxsize <MB>` to adjust the size limit at any time._"
+        )
+        await event.reply(status_text)
+        return
+
+    # --- Command: Max File Size Limit ---
+    if text.startswith("/maxsize") or text.startswith("/limit"):
+        parts = text.split()
+        if len(parts) == 1:
+            if MAX_FILE_SIZE_MB is not None:
+                gb_val = MAX_FILE_SIZE_MB / 1024.0
+                await event.reply(
+                    f"🛑 **Current Max File Size Limit:** `{MAX_FILE_SIZE_MB:.1f} MB` (~`{gb_val:.2f} GB`)\n\n"
+                    f"• Files larger than this will be skipped safely.\n"
+                    f"• To change limit: `/maxsize <size>` (e.g. `/maxsize 500` or `/maxsize 1.5GB`)\n"
+                    f"• To disable limit: `/maxsize off`"
+                )
+            else:
+                await event.reply(
+                    "🛑 **Current Max File Size Limit:** `Disabled (Unlimited)`\n\n"
+                    "• Files will be downloaded up to Telegram's native limit (2GB/4GB).\n"
+                    "• To set a limit: `/maxsize <size>` (e.g. `/maxsize 500` or `/maxsize 1.5GB`)"
+                )
+            return
+
+        parsed_size = parse_size_argument(parts[1])
+        if parsed_size is False:
+            await event.reply(
+                "❌ **Invalid Size Format!**\n\n"
+                "**Examples:**\n"
+                "• `/maxsize 500` (500 MB)\n"
+                "• `/maxsize 1.5GB` (1.5 Gigabytes)\n"
+                "• `/maxsize 800MB` (800 Megabytes)\n"
+                "• `/maxsize off` (Disable limit / unlimited)"
+            )
+            return
+
+        MAX_FILE_SIZE_MB = parsed_size
+        if MAX_FILE_SIZE_MB is not None:
+            gb_val = MAX_FILE_SIZE_MB / 1024.0
+            await event.reply(
+                f"✅ **Max File Size Limit Set!**\n\n"
+                f"╭────────────────────────────\n"
+                f"│ 🛑 **Max Size:** `{MAX_FILE_SIZE_MB:.1f} MB` (~`{gb_val:.2f} GB`)\n"
+                f"│ 🛡️ **Action:** Larger files skipped safely\n"
+                f"╰────────────────────────────\n"
+                f"_Any file larger than this will be skipped without interrupting batches._"
+            )
+        else:
+            await event.reply(
+                "✅ **Max File Size Limit Disabled.**\n\n"
+                "All files up to Telegram's native MTProto limit (2GB/4GB) will now be downloaded."
+            )
         return
         
     # --- Command: Restart ---
@@ -1004,8 +1160,15 @@ async def handle_new_message(event):
             await event.reply("⚠️ **Warning:** Batch size is limited to 60 messages at once to avoid account safety bans.")
             return
             
-        # Inform user starting batch
-        status = await event.reply(f"🔄 **Starting Batch Download:** `{total_items}` messages in range `{min_id}` to `{max_id}`...")
+        limit_str = f"`{MAX_FILE_SIZE_MB:.1f} MB`" if MAX_FILE_SIZE_MB else "`Unlimited`"
+        status = await event.reply(
+            f"🔄 **Starting Batch Download**\n"
+            f"╭────────────────────────────\n"
+            f"│ 📋 **Total Messages:** `{total_items}`\n"
+            f"│ 🔢 **Range:** ID `{min_id}` to `{max_id}`\n"
+            f"│ 🛑 **Size Limit:** {limit_str}\n"
+            f"╰────────────────────────────"
+        )
         
         # Get Chat Entity
         try:
@@ -1019,6 +1182,7 @@ async def handle_new_message(event):
             return
             
         success_count = 0
+        skipped_count = 0
         
         for idx, msg_id in enumerate(range(min_id, max_id + 1), start=1):
             logger.info(f"Batch processing message ID {msg_id} ({idx}/{total_items})")
@@ -1037,15 +1201,22 @@ async def handle_new_message(event):
                 batch_info=(idx, total_items)
             )
             
-            if success:
+            if success is True:
                 success_count += 1
+            elif success == "skipped":
+                skipped_count += 1
                 
             # Add polite anti-flood sleep between files
             await asyncio.sleep(2.5)
             
         await status.edit(
-            f"✅ **Batch Processing Completed!**\n\n"
-            f"📊 **Results:** Successfully saved `{success_count}` of `{total_items}` videos."
+            f"✅ **Batch Download Completed!**\n"
+            f"╭────────────────────────────\n"
+            f"│ 🎯 **Total Range:** `{total_items}` messages\n"
+            f"│ 📥 **Successfully Saved:** `{success_count}`\n"
+            f"│ ⏭️ **Skipped (Over Limit / No Media):** `{total_items - success_count}`\n"
+            f"╰────────────────────────────\n"
+            f"✨ _All available restricted media processed safely._"
         )
         return
 
@@ -1114,7 +1285,7 @@ async def handle_new_message(event):
         is_private, chat_identifier, message_id = parsed
         
         # Create a status message to show live progress
-        status = await event.reply("🔍 **Link detected!** Querying Telegram servers for media info...")
+        status = await event.reply("🔍 **Querying Telegram MTProto...**\n_Resolving media metadata & size limits..._")
         
         # Get Chat Entity
         try:
@@ -1135,17 +1306,86 @@ async def handle_new_message(event):
             return
             
         success = await download_and_upload_video(chat_entity, message_id, status, text)
-        if success:
+        if success is True:
             await status.delete()  # Remove progress message on full success
 
 @handle_flood_wait_decorator
 async def handle_bot_message(event):
-    global active_clone_task, clone_state, SILENT_MODE
+    global active_clone_task, clone_state, SILENT_MODE, MAX_FILE_SIZE_MB
     if not event.is_private:
         return
         
     text = event.raw_text.strip()
     if not text:
+        return
+
+    # --- Command: Status ---
+    if text == "/status":
+        dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
+        limit_desc = f"`{MAX_FILE_SIZE_MB:.1f} MB` (~`{MAX_FILE_SIZE_MB/1024:.2f} GB`)" if MAX_FILE_SIZE_MB else "`Disabled (Unlimited)`"
+        mode_desc = "🔇 `Silent (No edits)`" if SILENT_MODE else "📊 `Verbose (Live progress bar)`"
+        
+        status_text = (
+            "⚙️ **SaveRestricted Controller Status**\n"
+            "╭────────────────────────────\n"
+            f"│ 🟢 **Status:** Active & Listening\n"
+            f"│ 🎯 **Destination:** `{dest_desc}`\n"
+            f"│ 🛑 **Max File Size:** {limit_desc}\n"
+            f"│ 📈 **Progress Mode:** {mode_desc}\n"
+            "╰────────────────────────────\n"
+            "💡 _Use `/maxsize <MB>` to adjust the size limit._"
+        )
+        await event.reply(status_text)
+        return
+
+    # --- Command: Max File Size Limit ---
+    if text.startswith("/maxsize") or text.startswith("/limit"):
+        parts = text.split()
+        if len(parts) == 1:
+            if MAX_FILE_SIZE_MB is not None:
+                gb_val = MAX_FILE_SIZE_MB / 1024.0
+                await event.reply(
+                    f"🛑 **Current Max File Size Limit:** `{MAX_FILE_SIZE_MB:.1f} MB` (~`{gb_val:.2f} GB`)\n\n"
+                    f"• Files larger than this will be skipped safely.\n"
+                    f"• To change limit: `/maxsize <size>` (e.g. `/maxsize 500` or `/maxsize 1.5GB`)\n"
+                    f"• To disable limit: `/maxsize off`"
+                )
+            else:
+                await event.reply(
+                    "🛑 **Current Max File Size Limit:** `Disabled (Unlimited)`\n\n"
+                    "• Files will be downloaded up to Telegram's native limit (2GB/4GB).\n"
+                    "• To set a limit: `/maxsize <size>` (e.g. `/maxsize 500` or `/maxsize 1.5GB`)"
+                )
+            return
+
+        parsed_size = parse_size_argument(parts[1])
+        if parsed_size is False:
+            await event.reply(
+                "❌ **Invalid Size Format!**\n\n"
+                "**Examples:**\n"
+                "• `/maxsize 500` (500 MB)\n"
+                "• `/maxsize 1.5GB` (1.5 Gigabytes)\n"
+                "• `/maxsize 800MB` (800 Megabytes)\n"
+                "• `/maxsize off` (Disable limit / unlimited)"
+            )
+            return
+
+        MAX_FILE_SIZE_MB = parsed_size
+        if MAX_FILE_SIZE_MB is not None:
+            gb_val = MAX_FILE_SIZE_MB / 1024.0
+            await event.reply(
+                f"✅ **Max File Size Limit Set!**\n\n"
+                f"╭────────────────────────────\n"
+                f"│ 🛑 **Max Size:** `{MAX_FILE_SIZE_MB:.1f} MB` (~`{gb_val:.2f} GB`)\n"
+                f"│ 🛡️ **Action:** Larger files skipped safely\n"
+                f"╰────────────────────────────\n"
+                f"_Any file larger than this will be skipped without interrupting batches._"
+            )
+        else:
+            await event.reply(
+                "✅ **Max File Size Limit Disabled.**\n\n"
+                "All files up to Telegram's native MTProto limit (2GB/4GB) will now be downloaded."
+            )
         return
         
     # Command: /restart
@@ -1276,17 +1516,27 @@ async def handle_bot_message(event):
     # Command: /help or /start
     elif text.startswith("/start") or text.startswith("/help"):
         dest_desc = "Saved Messages" if UPLOAD_CHAT_ENTITY == 'me' else getattr(UPLOAD_CHAT_ENTITY, 'title', str(UPLOAD_CHAT_ENTITY))
+        limit_desc = f"`{MAX_FILE_SIZE_MB:.1f} MB`" if MAX_FILE_SIZE_MB else "`Unlimited`"
+        mode_desc = "`Silent (Muted)`" if SILENT_MODE else "`Verbose (Live bar)`"
+        
         await event.reply(
-            "👋 **SaveRestricted Interactive Controller Bot**\n\n"
+            "👋 **SaveRestricted Interactive Controller Bot**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "This bot acts as your interactive controller for cloning channels and downloading media.\n\n"
-            "💡 **Commands:**\n"
-            "• `/clone <message_link>` - Start interactive channel cloning starting from any message\n"
-            "• `/restart` - Restart the bot process completely\n"
-            "• `/refresh` - Reload configuration and refresh client connection\n"
-            "• `/silent` (or `/hide`) - Hide transfer progress updates (saves API limits)\n"
-            "• `/show` (or `/verbose`) - Show transfer progress updates\n"
-            "• `/help` - Show this message\n\n"
-            f"📥 **Current Upload Destination:** `{dest_desc}`"
+            "⚡ **Available Commands:**\n"
+            "• `/clone <message_link>` - Start interactive channel cloning\n"
+            "• `/maxsize <size>` - Set size limit (e.g. `/maxsize 500`, `/maxsize 1.5GB`)\n"
+            "• `/maxsize off` - Disable file size limit\n"
+            "• `/status` - Check limits & destination info\n"
+            "• `/silent` (or `/hide`) - Hide live progress edits\n"
+            "• `/show` (or `/verbose`) - Show live progress bars\n"
+            "• `/refresh` - Reload configuration & refresh connection\n"
+            "• `/restart` - Restart bot process\n"
+            "• `/help` - Show this guide\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 **Destination:** `{dest_desc}`\n"
+            f"🛑 **Current Max Size:** {limit_desc}\n"
+            f"🔇 **Progress Mode:** {mode_desc}"
         )
 
 async def safe_edit_or_respond(event, text, buttons=None):

@@ -86,6 +86,35 @@ Archiving a course or saving multiple videos from a channel is incredibly easy:
 
 ---
 
+### 🛑 3. Set Max File Size Limit
+Prevent large files from exhausting your storage or bandwidth:
+* **Check current limit:**
+  ```text
+  /maxsize
+  ```
+* **Set limit (in MB or GB):**
+  ```text
+  /maxsize 500
+  /maxsize 1.5GB
+  ```
+* **Disable size limit:**
+  ```text
+  /maxsize off
+  ```
+*(When a file in a batch exceeds your size limit, the bot skips it safely with an informative notification and moves directly to the next message without interrupting the batch).*
+
+---
+
+### ⚙️ 4. Useful Control Commands
+* `/help` or `/start` — View the interactive command control center.
+* `/status` — View current download destination, size limits, and silent mode status.
+* `/silent` or `/hide` — Mute live progress edits (helpful for strict API rate limits).
+* `/show` or `/verbose` — Re-enable real-time progress bars.
+* `/refresh` — Refresh MTProto connection and reload channel destinations.
+* `/restart` — Full restart of the userbot process.
+
+---
+
 ## 🛡️ Account Safety & Limits
 
 * **Flood Limits (`FloodWait`):** Telegram limits rapid successive requests. The bot includes automatic retry-on-flood waits. The `/batch` command includes a deliberate delay of `2.5` seconds between transfers to keep your account in safe standing.
